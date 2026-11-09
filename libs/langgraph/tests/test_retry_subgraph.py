@@ -6,6 +6,7 @@ retried attempt works on a namespace no later resume will look at, and what it
 asked or computed there is lost.
 """
 
+import asyncio
 import sys
 from typing import Any
 
@@ -252,3 +253,45 @@ async def test_each_subgraph_call_in_a_retried_node_reuses_its_answer_async(
 
     assert questions == 2
     assert result == {"amount": 12}
+
+
+@NEEDS_CONTEXTVARS
+@pytest.mark.parametrize("durability", ["sync", "async"])
+async def test_parallel_subgraph_calls_in_a_retried_node_keep_their_own_results(
+    async_checkpointer: BaseCheckpointSaver, durability: Durability
+) -> None:
+    failures: list[bool] = []
+
+    def add_one(state: State) -> State:
+        return {"amount": state["amount"] + 1}
+
+    inner = (
+        StateGraph(State)
+        .add_node("add_one", add_one)
+        .add_edge(START, "add_one")
+        .add_edge("add_one", END)
+        .compile()
+    )
+
+    async def both(state: State) -> State:
+        first, second = await asyncio.gather(
+            inner.ainvoke({"amount": 100}), inner.ainvoke({"amount": 200})
+        )
+        if not failures:
+            failures.append(True)
+            raise RuntimeError("fails after both calls")
+        return {"amount": first["amount"] * 1000 + second["amount"]}
+
+    graph = (
+        StateGraph(State)
+        .add_node("both", both, retry_policy=RETRY_ONCE)
+        .add_edge(START, "both")
+        .add_edge("both", END)
+        .compile(checkpointer=async_checkpointer)
+    )
+
+    result = await graph.ainvoke({}, _config("parallel"), durability=durability)
+
+    # asyncio.gather starts its calls in a fixed order, so each call finds the
+    # checkpoint namespace it used on the first attempt.
+    assert result == {"amount": 101 * 1000 + 201}
