@@ -14,6 +14,7 @@ import pytest
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from typing_extensions import TypedDict
 
+from langgraph._internal._constants import CONFIG_KEY_STRICT_RESUME
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, Durability, RetryPolicy, interrupt
@@ -295,3 +296,42 @@ async def test_parallel_subgraph_calls_in_a_retried_node_keep_their_own_results(
     # asyncio.gather starts its calls in a fixed order, so each call finds the
     # checkpoint namespace it used on the first attempt.
     assert result == {"amount": 101 * 1000 + 201}
+
+
+def test_a_retried_subgraph_reuses_its_answer_in_strict_resume(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """The subgraph twin of `test_a_retried_node_reuses_its_answer`.
+
+    The answer is given by the id of the question, as strict resume expects.
+    A retried subgraph must take it and finish, as a retried plain node does,
+    rather than ask a new question under a new id.
+    """
+    graph, calls = _ask_then_check(sync_checkpointer)
+    config = {"configurable": {"thread_id": "strict", CONFIG_KEY_STRICT_RESUME: True}}
+    graph.invoke({}, config)
+    (card,) = graph.get_state(config).interrupts
+
+    result = graph.invoke(Command(resume={card.id: 5}), config)
+
+    assert "__interrupt__" not in result
+    assert result == {"amount": 5}
+    assert calls == [5, 5]
+
+
+@NEEDS_CONTEXTVARS
+async def test_a_retried_subgraph_reuses_its_answer_in_strict_resume_async(
+    async_checkpointer: BaseCheckpointSaver,
+) -> None:
+    graph, calls = _ask_then_check(async_checkpointer)
+    config = {
+        "configurable": {"thread_id": "strict-async", CONFIG_KEY_STRICT_RESUME: True}
+    }
+    await graph.ainvoke({}, config)
+    (card,) = (await graph.aget_state(config)).interrupts
+
+    result = await graph.ainvoke(Command(resume={card.id: 5}), config)
+
+    assert "__interrupt__" not in result
+    assert result == {"amount": 5}
+    assert calls == [5, 5]
