@@ -574,12 +574,17 @@ def _checkpoint_ns_for_parent_command(ns: str) -> str:
 
 
 def _reset_scratchpad_counters(config: RunnableConfig) -> RunnableConfig:
-    # A retry reruns the node from its first line, so its interrupt() calls and
-    # its subgraph calls count from the first again. Interrupts then reuse the
-    # answers the task already has, rather than asking again under an id the next
-    # resume can't match. Subgraphs then run in the checkpoint namespace the
-    # failed attempt used, the one a later resume of this task will also read,
-    # rather than in a new namespace nothing else looks at.
+    # A retry runs the node again from its first line, so everything the node
+    # counts while it runs has to start from zero again:
+    #
+    # - interrupt_counter: the node's own interrupt() calls reuse the answers
+    #   the task already has, instead of asking again under an id the next
+    #   resume cannot match.
+    # - subgraph_counter: a subgraph's loop appends this counter to its
+    #   checkpoint namespace when it is above 0 (see PregelLoop.__init__). Left
+    #   running, the retried subgraph would use `<ns>|1`, while a later resume of
+    #   this task counts from 0 again and reads `<ns>`. The answer given to the
+    #   retried subgraph would then never be read.
     scratchpad = config[CONF].get(CONFIG_KEY_SCRATCHPAD)
     if scratchpad is None:
         return config
@@ -703,8 +708,13 @@ def run_with_retry(
                 f"Retrying task {task.name} after {sleep_time:.2f} seconds (attempt {attempts}) after {exc.__class__.__name__} {exc}",
                 exc_info=exc,
             )
-            # signal subgraphs to start over, not to resume the failed attempt:
-            # they run again from their first node and ask their questions again
+            # A subgraph node starts over on retry instead of resuming the failed
+            # attempt, so it runs again from its first node and asks its
+            # questions again. RESUMING=False makes the subgraph start a new run
+            # rather than continue from the checkpoint the failed attempt left.
+            # Resetting the counters makes that run use the same checkpoint
+            # namespace as the failed attempt, which is the one a later resume
+            # reads, so the answer to the new question is the one that counts.
             config = patch_configurable(config, {CONFIG_KEY_RESUMING: False})
             config = _reset_scratchpad_counters(config)
 
@@ -853,8 +863,13 @@ async def arun_with_retry(
                 f"Retrying task {task.name} after {sleep_time:.2f} seconds (attempt {attempts}) after {exc.__class__.__name__} {exc}",
                 exc_info=exc,
             )
-            # signal subgraphs to start over, not to resume the failed attempt:
-            # they run again from their first node and ask their questions again
+            # A subgraph node starts over on retry instead of resuming the failed
+            # attempt, so it runs again from its first node and asks its
+            # questions again. RESUMING=False makes the subgraph start a new run
+            # rather than continue from the checkpoint the failed attempt left.
+            # Resetting the counters makes that run use the same checkpoint
+            # namespace as the failed attempt, which is the one a later resume
+            # reads, so the answer to the new question is the one that counts.
             config = patch_configurable(config, {CONFIG_KEY_RESUMING: False})
             config = _reset_scratchpad_counters(config)
 

@@ -3,6 +3,16 @@
 A retry reruns a node from its first line. When the node is a subgraph, the
 retry runs the subgraph from its start in the checkpoint namespace the failed
 attempt used, so the answer to the new question is the one a later resume reads.
+
+The tests below pin four things together, for sync and async subgraphs:
+
+- how many questions are asked (one per attempt),
+- which answer is accepted (the one given to the latest question),
+- which calls the flaky service receives (every answer, in order),
+- that a retried subgraph restarts from its first node.
+
+Strict resume gets its own tests: each question has its own id, and the answer
+to the retry's question must be accepted by that id.
 """
 
 import sys
@@ -113,6 +123,7 @@ def test_a_retried_subgraph_asks_again_and_uses_the_new_answer(
     graph, calls = _ask_then_check(sync_checkpointer)
     config = _config("ask-again")
 
+    # The subgraph asks "How much?" and the first call to the service fails.
     result = graph.invoke({}, config, durability=durability)
     assert [i.value for i in result["__interrupt__"]] == ["How much?"]
 
@@ -125,6 +136,7 @@ def test_a_retried_subgraph_asks_again_and_uses_the_new_answer(
 
     assert "__interrupt__" not in result
     assert result == {"amount": 7}
+    # The service saw both answers, in the order they were given.
     assert calls == [5, 7]
 
 
@@ -156,6 +168,8 @@ def test_a_retried_subgraph_starts_from_its_first_node(
     result = graph.invoke({}, _config("restart"), durability=durability)
 
     assert result == {"amount": 2}
+    # `second` failed once, so the retry runs the subgraph again from `first`
+    # instead of resuming at the node that failed.
     assert ran == ["first", "second", "first", "second"]
 
 
@@ -181,9 +195,11 @@ def test_a_retried_subgraph_asks_a_new_question_in_strict_resume(
     """
     graph, calls = _ask_then_check(sync_checkpointer)
     config = {"configurable": {"thread_id": "strict", CONFIG_KEY_STRICT_RESUME: True}}
+    # First question: answered by its id.
     graph.invoke({}, config)
     (first,) = graph.get_state(config).interrupts
 
+    # The service fails, so the retry asks a second question with its own id.
     graph.invoke(Command(resume={first.id: 5}), config)
     (second,) = graph.get_state(config).interrupts
     result = graph.invoke(Command(resume={second.id: 7}), config)
@@ -202,9 +218,11 @@ async def test_a_retried_subgraph_asks_a_new_question_in_strict_resume_async(
     config = {
         "configurable": {"thread_id": "strict-async", CONFIG_KEY_STRICT_RESUME: True}
     }
+    # First question: answered by its id.
     await graph.ainvoke({}, config)
     (first,) = (await graph.aget_state(config)).interrupts
 
+    # The service fails, so the retry asks a second question with its own id.
     await graph.ainvoke(Command(resume={first.id: 5}), config)
     (second,) = (await graph.aget_state(config)).interrupts
     result = await graph.ainvoke(Command(resume={second.id: 7}), config)
