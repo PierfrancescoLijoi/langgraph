@@ -577,9 +577,9 @@ def _reset_scratchpad_counters(config: RunnableConfig) -> RunnableConfig:
     # A retry reruns the node from its first line, so its interrupt() calls and
     # its subgraph calls count from the first again. Interrupts then reuse the
     # answers the task already has, rather than asking again under an id the next
-    # resume can't match. Subgraphs then resume from the checkpoint namespace the
+    # resume can't match. Subgraphs then run in the checkpoint namespace the
     # failed attempt used, the one a later resume of this task will also read,
-    # rather than start in a new namespace nothing else looks at.
+    # rather than in a new namespace nothing else looks at.
     scratchpad = config[CONF].get(CONFIG_KEY_SCRATCHPAD)
     if scratchpad is None:
         return config
@@ -703,8 +703,9 @@ def run_with_retry(
                 f"Retrying task {task.name} after {sleep_time:.2f} seconds (attempt {attempts}) after {exc.__class__.__name__} {exc}",
                 exc_info=exc,
             )
-            # signal subgraphs to resume (if available)
-            config = patch_configurable(config, {CONFIG_KEY_RESUMING: True})
+            # signal subgraphs to start over, not to resume the failed attempt:
+            # they run again from their first node and ask their questions again
+            config = patch_configurable(config, {CONFIG_KEY_RESUMING: False})
             config = _reset_scratchpad_counters(config)
 
 
@@ -852,8 +853,9 @@ async def arun_with_retry(
                 f"Retrying task {task.name} after {sleep_time:.2f} seconds (attempt {attempts}) after {exc.__class__.__name__} {exc}",
                 exc_info=exc,
             )
-            # signal subgraphs to resume (if available)
-            config = patch_configurable(config, {CONFIG_KEY_RESUMING: True})
+            # signal subgraphs to start over, not to resume the failed attempt:
+            # they run again from their first node and ask their questions again
+            config = patch_configurable(config, {CONFIG_KEY_RESUMING: False})
             config = _reset_scratchpad_counters(config)
 
 

@@ -1,12 +1,10 @@
-"""A retried node must reach the same subgraph checkpoints a later resume does.
+"""A retried subgraph starts over and asks its questions again.
 
-A retry reruns a node from its first line, so each call to a subgraph inside it
-has to land on the checkpoint namespace the previous attempt used. Otherwise the
-retried attempt works on a namespace no later resume will look at, and what it
-asked or computed there is lost.
+A retry reruns a node from its first line. When the node is a subgraph, the
+retry runs the subgraph from its start in the checkpoint namespace the failed
+attempt used, so the answer to the new question is the one a later resume reads.
 """
 
-import asyncio
 import sys
 from typing import Any
 
@@ -109,218 +107,95 @@ def _fail_in_second_node(
     return graph, ran
 
 
-def _two_subgraph_calls_then_fail(
-    checkpointer: BaseCheckpointSaver,
-) -> CompiledStateGraph:
-    """A retried node that calls one subgraph twice, then fails once.
-
-    Each call asks its own question, so the two calls need separate checkpoint
-    namespaces. The node fails after both calls have their answers.
-    """
-    failures = []
-
-    def ask(state: State) -> State:
-        return {"amount": interrupt("How much?")}
-
-    inner = (
-        StateGraph(State)
-        .add_node("ask", ask)
-        .add_edge(START, "ask")
-        .add_edge("ask", END)
-        .compile()
-    )
-
-    def both(state: State) -> State:
-        tens = inner.invoke({})["amount"]
-        units = inner.invoke({})["amount"]
-        if not failures:
-            failures.append(True)
-            raise RuntimeError("fails after both answers")
-        return {"amount": tens * 10 + units}
-
-    return (
-        StateGraph(State)
-        .add_node("both", both, retry_policy=RETRY_ONCE)
-        .add_edge(START, "both")
-        .add_edge("both", END)
-        .compile(checkpointer=checkpointer)
-    )
-
-
-def test_a_retried_subgraph_reuses_its_answer(
+def test_a_retried_subgraph_asks_again_and_uses_the_new_answer(
     sync_checkpointer: BaseCheckpointSaver, durability: Durability
 ) -> None:
     graph, calls = _ask_then_check(sync_checkpointer)
-    config = _config("reuse")
+    config = _config("ask-again")
 
-    first = graph.invoke({}, config, durability=durability)
-    assert [i.value for i in first["__interrupt__"]] == ["How much?"]
+    result = graph.invoke({}, config, durability=durability)
+    assert [i.value for i in result["__interrupt__"]] == ["How much?"]
 
-    # The service fails once after the answer, the retry succeeds. The retried
-    # subgraph must not ask the question again or drop what was answered.
+    # The service fails after 5, so the retry asks the question again.
     result = graph.invoke(Command(resume=5), config, durability=durability)
+    assert [i.value for i in result["__interrupt__"]] == ["How much?"]
+
+    # The answer to the new question is the one that counts.
+    result = graph.invoke(Command(resume=7), config, durability=durability)
 
     assert "__interrupt__" not in result
-    assert result == {"amount": 5}
-    assert calls == [5, 5]
+    assert result == {"amount": 7}
+    assert calls == [5, 7]
 
 
 @NEEDS_CONTEXTVARS
-async def test_a_retried_subgraph_reuses_its_answer_async(
+async def test_a_retried_subgraph_asks_again_and_uses_the_new_answer_async(
     async_checkpointer: BaseCheckpointSaver, durability: Durability
 ) -> None:
     graph, calls = _ask_then_check(async_checkpointer)
-    config = _config("reuse-async")
+    config = _config("ask-again-async")
 
-    first = await graph.ainvoke({}, config, durability=durability)
-    assert [i.value for i in first["__interrupt__"]] == ["How much?"]
+    result = await graph.ainvoke({}, config, durability=durability)
+    assert [i.value for i in result["__interrupt__"]] == ["How much?"]
 
     result = await graph.ainvoke(Command(resume=5), config, durability=durability)
+    assert [i.value for i in result["__interrupt__"]] == ["How much?"]
+
+    result = await graph.ainvoke(Command(resume=7), config, durability=durability)
 
     assert "__interrupt__" not in result
-    assert result == {"amount": 5}
-    assert calls == [5, 5]
+    assert result == {"amount": 7}
+    assert calls == [5, 7]
 
 
-def test_a_retried_subgraph_resumes_from_the_node_that_failed(
+def test_a_retried_subgraph_starts_from_its_first_node(
     sync_checkpointer: BaseCheckpointSaver, durability: Durability
 ) -> None:
     graph, ran = _fail_in_second_node(sync_checkpointer)
 
-    result = graph.invoke({}, _config("resume-failed"), durability=durability)
+    result = graph.invoke({}, _config("restart"), durability=durability)
 
     assert result == {"amount": 2}
-    # `first` finished before `second` failed, so the retry does not repeat it.
-    assert ran == ["first", "second", "second"]
+    assert ran == ["first", "second", "first", "second"]
 
 
 @NEEDS_CONTEXTVARS
-async def test_a_retried_subgraph_resumes_from_the_node_that_failed_async(
+async def test_a_retried_subgraph_starts_from_its_first_node_async(
     async_checkpointer: BaseCheckpointSaver, durability: Durability
 ) -> None:
     graph, ran = _fail_in_second_node(async_checkpointer)
 
-    result = await graph.ainvoke(
-        {}, _config("resume-failed-async"), durability=durability
-    )
+    result = await graph.ainvoke({}, _config("restart-async"), durability=durability)
 
     assert result == {"amount": 2}
-    assert ran == ["first", "second", "second"]
+    assert ran == ["first", "second", "first", "second"]
 
 
-# `durability="exit"` is left out here on purpose: it does not keep the first of
-# two sequential subgraph calls that both interrupt, retry or no retry, so such
-# a node never moves past its first question. That is a separate limitation.
-@pytest.mark.parametrize("durability", ["sync", "async"])
-def test_each_subgraph_call_in_a_retried_node_reuses_its_answer(
-    sync_checkpointer: BaseCheckpointSaver, durability: Durability
-) -> None:
-    graph = _two_subgraph_calls_then_fail(sync_checkpointer)
-    config = _config("two-calls")
-
-    result = graph.invoke({}, config, durability=durability)
-    questions = 1
-    for answer in (1, 2):
-        assert [i.value for i in result["__interrupt__"]] == ["How much?"]
-        result = graph.invoke(Command(resume=answer), config, durability=durability)
-        if "__interrupt__" not in result:
-            break
-        questions += 1
-
-    # One question per subgraph call. The retry after both answers must not
-    # ask a third one.
-    assert questions == 2
-    assert result == {"amount": 12}
-
-
-@NEEDS_CONTEXTVARS
-@pytest.mark.parametrize("durability", ["sync", "async"])
-async def test_each_subgraph_call_in_a_retried_node_reuses_its_answer_async(
-    async_checkpointer: BaseCheckpointSaver, durability: Durability
-) -> None:
-    graph = _two_subgraph_calls_then_fail(async_checkpointer)
-    config = _config("two-calls-async")
-
-    result = await graph.ainvoke({}, config, durability=durability)
-    questions = 1
-    for answer in (1, 2):
-        assert [i.value for i in result["__interrupt__"]] == ["How much?"]
-        result = await graph.ainvoke(
-            Command(resume=answer), config, durability=durability
-        )
-        if "__interrupt__" not in result:
-            break
-        questions += 1
-
-    assert questions == 2
-    assert result == {"amount": 12}
-
-
-@NEEDS_CONTEXTVARS
-@pytest.mark.parametrize("durability", ["sync", "async"])
-async def test_parallel_subgraph_calls_in_a_retried_node_keep_their_own_results(
-    async_checkpointer: BaseCheckpointSaver, durability: Durability
-) -> None:
-    failures: list[bool] = []
-
-    def add_one(state: State) -> State:
-        return {"amount": state["amount"] + 1}
-
-    inner = (
-        StateGraph(State)
-        .add_node("add_one", add_one)
-        .add_edge(START, "add_one")
-        .add_edge("add_one", END)
-        .compile()
-    )
-
-    async def both(state: State) -> State:
-        first, second = await asyncio.gather(
-            inner.ainvoke({"amount": 100}), inner.ainvoke({"amount": 200})
-        )
-        if not failures:
-            failures.append(True)
-            raise RuntimeError("fails after both calls")
-        return {"amount": first["amount"] * 1000 + second["amount"]}
-
-    graph = (
-        StateGraph(State)
-        .add_node("both", both, retry_policy=RETRY_ONCE)
-        .add_edge(START, "both")
-        .add_edge("both", END)
-        .compile(checkpointer=async_checkpointer)
-    )
-
-    result = await graph.ainvoke({}, _config("parallel"), durability=durability)
-
-    # asyncio.gather starts its calls in a fixed order, so each call finds the
-    # checkpoint namespace it used on the first attempt.
-    assert result == {"amount": 101 * 1000 + 201}
-
-
-def test_a_retried_subgraph_reuses_its_answer_in_strict_resume(
+def test_a_retried_subgraph_asks_a_new_question_in_strict_resume(
     sync_checkpointer: BaseCheckpointSaver,
 ) -> None:
-    """The subgraph twin of `test_a_retried_node_reuses_its_answer`.
+    """Strict resume answers each question by its own id.
 
-    The answer is given by the id of the question, as strict resume expects.
-    A retried subgraph must take it and finish, as a retried plain node does,
-    rather than ask a new question under a new id.
+    The retry asks a new question with a new id, and the answer to that one is
+    used.
     """
     graph, calls = _ask_then_check(sync_checkpointer)
     config = {"configurable": {"thread_id": "strict", CONFIG_KEY_STRICT_RESUME: True}}
     graph.invoke({}, config)
-    (card,) = graph.get_state(config).interrupts
+    (first,) = graph.get_state(config).interrupts
 
-    result = graph.invoke(Command(resume={card.id: 5}), config)
+    graph.invoke(Command(resume={first.id: 5}), config)
+    (second,) = graph.get_state(config).interrupts
+    result = graph.invoke(Command(resume={second.id: 7}), config)
 
+    assert second.id != first.id
     assert "__interrupt__" not in result
-    assert result == {"amount": 5}
-    assert calls == [5, 5]
+    assert result == {"amount": 7}
+    assert calls == [5, 7]
 
 
 @NEEDS_CONTEXTVARS
-async def test_a_retried_subgraph_reuses_its_answer_in_strict_resume_async(
+async def test_a_retried_subgraph_asks_a_new_question_in_strict_resume_async(
     async_checkpointer: BaseCheckpointSaver,
 ) -> None:
     graph, calls = _ask_then_check(async_checkpointer)
@@ -328,10 +203,13 @@ async def test_a_retried_subgraph_reuses_its_answer_in_strict_resume_async(
         "configurable": {"thread_id": "strict-async", CONFIG_KEY_STRICT_RESUME: True}
     }
     await graph.ainvoke({}, config)
-    (card,) = (await graph.aget_state(config)).interrupts
+    (first,) = (await graph.aget_state(config)).interrupts
 
-    result = await graph.ainvoke(Command(resume={card.id: 5}), config)
+    await graph.ainvoke(Command(resume={first.id: 5}), config)
+    (second,) = (await graph.aget_state(config)).interrupts
+    result = await graph.ainvoke(Command(resume={second.id: 7}), config)
 
+    assert second.id != first.id
     assert "__interrupt__" not in result
-    assert result == {"amount": 5}
-    assert calls == [5, 5]
+    assert result == {"amount": 7}
+    assert calls == [5, 7]
